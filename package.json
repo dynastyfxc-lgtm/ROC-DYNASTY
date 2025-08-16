@@ -1,0 +1,10 @@
+{
+  "name": "roc-dynasty-serverless",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "stripe": "^16.1.0",
+    "firebase-admin": "^12.5.0",
+    "raw-body": "^2.5.2"
+  }
+}
