@@ -1,65 +1,69 @@
-// api/stripe-webhook.js  (Vercel / Node serverless)
+// api/stripe-webhook.js
 
 import Stripe from "stripe";
 import getRawBody from "raw-body";
 
 export const config = {
-  api: { bodyParser: false }, // Stripe requires the raw body (no JSON parsing)
+  api: { bodyParser: false }, // Stripe needs the raw request body
 };
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-  // apiVersion: "2025-07-30.basil", // optional, keep if you want to pin
-});
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 export default async function handler(req, res) {
-  // Webhook expects POST only
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
     return res.status(405).send("Method Not Allowed");
   }
 
-  // --- read raw body exactly as sent ---
+  // 1) Read raw body exactly as Stripe sent it
   let rawBody;
   try {
     rawBody = await getRawBody(req, {
       length: req.headers["content-length"],
       limit: "2mb",
-      encoding: false, // return a Buffer
+      encoding: false, // Buffer
     });
   } catch (e) {
     console.error("Failed to read raw body:", e);
     return res.status(400).send("Invalid body");
   }
 
+  // 2) Get signature + secrets
   const signature =
     req.headers["stripe-signature"] || req.headers["Stripe-Signature"];
+  const dashboardSecret = process.env.STRIPE_WEBHOOK_SECRET;        // whsec from Stripe Dashboard (endpoint page)
+  const cliSecret = process.env.STRIPE_CLI_WEBHOOK_SECRET || null;  // whsec printed by `stripe listen` (optional)
 
-  // Support either the dashboard endpoint secret or a CLI secret (if you use `stripe listen`)
-  const primarySecret = process.env.STRIPE_WEBHOOK_SECRET;           // whsec_... from Dashboard → your endpoint
-  const cliSecret = process.env.STRIPE_CLI_WEBHOOK_SECRET || null;   // whsec_... printed by `stripe listen`
-  const secrets = [primarySecret, cliSecret].filter(Boolean);
-
-  if (secrets.length === 0) {
+  if (!dashboardSecret && !cliSecret) {
     console.error("No webhook secret set in env");
     return res.status(500).send("Server misconfigured");
   }
 
+  // 3) Verify with dashboard secret first; if it fails and we have CLI secret, try that
   let event;
   try {
-    // Stripe SDK accepts an array of secrets (helps with rotation / CLI vs Dashboard)
-    event = stripe.webhooks.constructEvent(rawBody, signature, secrets);
-  } catch (err) {
-    console.error("❌ Webhook verify failed:", err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+    event = stripe.webhooks.constructEvent(rawBody, signature, dashboardSecret);
+  } catch (err1) {
+    if (cliSecret) {
+      try {
+        event = stripe.webhooks.constructEvent(rawBody, signature, cliSecret);
+      } catch (err2) {
+        console.error("❌ Webhook verify failed (both secrets):", err2.message);
+        return res.status(400).send(`Webhook Error: ${err2.message}`);
+      }
+    } else {
+      console.error("❌ Webhook verify failed:", err1.message);
+      return res.status(400).send(`Webhook Error: ${err1.message}`);
+    }
   }
 
-  // --- handle events ---
+  // 4) Handle events
   try {
     switch (event.type) {
       case "checkout.session.completed": {
         const session = event.data.object;
         console.log("✅ checkout.session.completed", session.id);
-        // TODO: write Firestore subscription status here (if desired)
+        // TODO: write Firestore subscription status here if needed
         break;
       }
       case "customer.subscription.created":
@@ -74,8 +78,8 @@ export default async function handler(req, res) {
     }
 
     return res.status(200).json({ received: true });
-  } catch (err) {
-    console.error("Handler error:", err);
+  } catch (e) {
+    console.error("Handler error:", e);
     return res.status(500).send("Internal Server Error");
   }
 }
