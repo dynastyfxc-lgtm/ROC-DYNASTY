@@ -1,32 +1,30 @@
 // lib/firebaseAdmin.js
-import admin from 'firebase-admin';
+// ESM-friendly, single-init Firebase Admin for Vercel functions
+
+import { getApps, getApp, initializeApp, cert } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
 
 let app;
 
-// Only initialize once (Vercel can reuse the same instance)
-if (!admin.apps.length) {
-  const sa = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
-  if (!sa) {
-    throw new Error('FIREBASE_SERVICE_ACCOUNT_KEY is missing');
-  }
+// Parse service account JSON from env
+const raw = process.env.FIREBASE_SERVICE_ACCOUNT_KEY || '{}';
+const sa = JSON.parse(raw);
 
-  let serviceAccount;
-  try {
-    serviceAccount = JSON.parse(sa);
-  } catch (e) {
-    console.error('Failed to parse FIREBASE_SERVICE_ACCOUNT_KEY:', e);
-    throw e;
-  }
-
-  // Optional: small safe log to verify which identity is used
-  console.log('🔥 Firebase Admin initializing with:', serviceAccount.client_email);
-
-  app = admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
-} else {
-  app = admin.app();
+// Fix escaped newlines in private_key if present (\\n -> \n)
+if (sa.private_key && sa.private_key.includes('\\n')) {
+  sa.private_key = sa.private_key.replace(/\\n/g, '\n');
 }
 
-export const db = admin.firestore();
+if (!getApps().length) {
+  app = initializeApp({
+    credential: cert(sa),
+  });
+  // Safe, one-line init log (helps debugging in Vercel logs)
+  console.log('🔥 Firebase Admin initialized for:', sa.client_email || '(no client_email)');
+} else {
+  app = getApp();
+}
+
+export const db = getFirestore(app);
+
 
