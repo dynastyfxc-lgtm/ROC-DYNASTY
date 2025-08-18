@@ -1,22 +1,23 @@
 // api/db-ping.js
-import { db } from "../lib/firebaseAdmin.js";
+import { db } from '../lib/firebaseAdmin.js';
 
 export default async function handler(req, res) {
   try {
-    // Simple read to prove Firestore connectivity
-    const snapshot = await db.collection("test").limit(1).get();
+    const ref = db.collection('__health').doc('ping');
+    const ts = Date.now();
 
-    res.status(200).json({
+    // write + read to verify Firestore access
+    await ref.set({ ts }, { merge: true });
+    const snap = await ref.get();
+
+    return res.status(200).json({
       ok: true,
-      message: "Connected to Firestore",
-      docs_found: snapshot.size,
+      wrote: ts,
+      read: snap.exists ? snap.data() : null,
     });
-  } catch (error) {
-    console.error("Firestore connection error:", error);
-    res.status(500).json({
-      ok: false,
-      error: error.message,
-    });
+  } catch (err) {
+    console.error('db-ping error:', err);
+    return res.status(500).json({ ok: false, error: String(err) });
   }
 }
 
