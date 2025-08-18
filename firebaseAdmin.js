@@ -10,7 +10,7 @@ let app;
 const raw = process.env.FIREBASE_SERVICE_ACCOUNT_KEY || '{}';
 const sa = JSON.parse(raw);
 
-// Fix escaped newlines in private_key if present (\\n -> \n)
+// Fix escaped newlines in private_key (\\n -> \n)
 if (sa.private_key && sa.private_key.includes('\\n')) {
   sa.private_key = sa.private_key.replace(/\\n/g, '\n');
 }
@@ -19,12 +19,12 @@ if (!getApps().length) {
   app = initializeApp({
     credential: cert(sa),
   });
-  // Safe, one-line init log (helps debugging in Vercel logs)
   console.log('🔥 Firebase Admin initialized for:', sa.client_email || '(no client_email)');
 } else {
   app = getApp();
 }
 
 export const db = getFirestore(app);
+
 
 
