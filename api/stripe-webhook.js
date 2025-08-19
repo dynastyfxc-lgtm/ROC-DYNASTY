@@ -1,83 +1,14 @@
-// api/stripe-webhook.js  (Vercel serverless / Node)
-// - Logs every event -> stripe_events
-// - Updates users collection on key subscription events
-
+// api/stripe-webhook.js
 import Stripe from "stripe";
 import getRawBody from "raw-body";
-import { db } from "../lib/firebaseAdmin.js";
-import admin from "firebase-admin";
+import { db } from "../lib/firebaseAdmin.js"; // uses your admin helper
 
 export const config = {
   api: { bodyParser: false }, // Stripe needs the raw body
 };
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-  apiVersion: "2025-07-30.basil",
-});
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// ---------- helpers ----------
-const { FieldValue } = admin.firestore;
-
-async function upsertStripeEvent(event) {
-  const ref = db.collection("stripe_events").doc(event.id);
-  await ref.set(
-    {
-      id: event.id,
-      type: event.type,
-      created: event.created,
-      receivedAt: FieldValue.serverTimestamp(),
-      data: event.data?.object ?? null,
-    },
-    { merge: true }
-  );
-}
-
-async function findUserRef({ userId, customerId, email }) {
-  // 1) explicit userId from Checkout metadata (best)
-  if (userId) {
-    return db.collection("users").doc(userId);
-  }
-
-  // 2) match by stripeCustomerId (recommended)
-  if (customerId) {
-    const snap = await db
-      .collection("users")
-      .where("stripeCustomerId", "==", customerId)
-      .limit(1)
-      .get();
-    if (!snap.empty) return snap.docs[0].ref;
-  }
-
-  // 3) last resort: match by email
-  if (email) {
-    const snap = await db
-      .collection("users")
-      .where("email", "==", email)
-      .limit(1)
-      .get();
-    if (!snap.empty) return snap.docs[0].ref;
-  }
-
-  return null;
-}
-
-async function updateUserFromSubscription({ userRef, sub }) {
-  const item = sub.items?.data?.[0];
-  await userRef.set(
-    {
-      subscriptionId: sub.id,
-      subscriptionStatus: sub.status, // active, trialing, past_due, canceled, etc.
-      priceId: item?.price?.id ?? null,
-      productId: item?.price?.product ?? null,
-      currentPeriodEnd: sub.current_period_end ? sub.current_period_end * 1000 : null,
-      stripeCustomerId: sub.customer ?? null,
-      updatedAt: FieldValue.serverTimestamp(),
-    },
-    { merge: true }
-  );
-}
-
-// ---------- webhook handler ----------
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -89,101 +20,122 @@ export default async function handler(req, res) {
     const raw = await getRawBody(req);
     const signature = req.headers["stripe-signature"];
     const secret = process.env.STRIPE_WEBHOOK_SECRET;
+
     event = stripe.webhooks.constructEvent(raw, signature, secret);
   } catch (err) {
-    console.error("❌ Webhook verify failed:", err.message);
+    console.error("Webhook verify failed:", err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  // 1) Log every event into Firestore for visibility/audit
   try {
-    // 1) ALWAYS log the event
-    await upsertStripeEvent(event);
+    await db.collection("stripe_events").doc(event.id).set({
+      id: event.id,
+      type: event.type,
+      created: event.created,
+      data: event.data?.object ?? null,
+      receivedAt: new Date(),
+    });
+  } catch (err) {
+    console.error("Failed to log stripe_event:", err);
+    // don't fail the webhook if logging fails
+  }
 
-    // 2) Handle important events
+  // 2) Handle important events
+  try {
     switch (event.type) {
       case "checkout.session.completed": {
         const session = event.data.object;
 
-        const userId = session.metadata?.userId ?? null;
+        // Try to get line items for price/product info (optional but useful)
+        let line;
+        try {
+          const items = await stripe.checkout.sessions.listLineItems(session.id, { limit: 10 });
+          line = items?.data?.[0] || null;
+        } catch (e) {
+          console.warn("Could not fetch line items:", e?.message);
+        }
+
+        // Identify user
+        const uid = session.client_reference_id || null;
         const email =
           session.customer_details?.email ||
           session.customer_email ||
           null;
-        const customerId = session.customer ?? null;
 
-        const userRef = await findUserRef({ userId, customerId, email });
-        if (!userRef) {
-          console.warn(
-            "⚠️ No matching user found for checkout.session.completed",
-            { userId, customerId, email }
-          );
-          break;
+        // Build payment/subscription payload to store
+        const payment = {
+          sessionId: session.id,
+          payment_status: session.payment_status,
+          mode: session.mode,                       // "payment" or "subscription"
+          amount_total: session.amount_total,        // in cents
+          currency: session.currency,
+          customer: session.customer || null,
+          customer_email: email,
+          priceId: line?.price?.id || null,
+          productId: line?.price?.product || null,
+          quantity: line?.quantity || 1,
+          createdAt: new Date(),
+        };
+
+        // Find or create the user doc
+        let userRef = null;
+
+        if (uid) {
+          userRef = db.collection("users").doc(uid);
+        } else if (email) {
+          const snap = await db.collection("users").where("email", "==", email).limit(1).get();
+          if (!snap.empty) {
+            userRef = snap.docs[0].ref;
+          } else {
+            // If you want to auto-create a user doc by email when UID isn't known:
+            userRef = db.collection("users").doc();
+            await userRef.set({ email, createdAt: new Date() }, { merge: true });
+          }
         }
 
-        // If a subscription was created via Checkout, fetch it
-        if (session.subscription) {
-          const sub = await stripe.subscriptions.retrieve(session.subscription);
-          await updateUserFromSubscription({ userRef, sub });
-        } else {
-          // one-time payment: store customer id at least
+        if (userRef) {
+          // Merge payment/subscription info onto the user
           await userRef.set(
             {
-              stripeCustomerId: customerId,
-              lastPaymentIntentId: session.payment_intent ?? null,
-              updatedAt: FieldValue.serverTimestamp(),
+              email,
+              lastCheckoutAt: new Date(),
+              subscription: {
+                status: session.payment_status === "paid" ? "active" : session.payment_status,
+                mode: session.mode,
+                priceId: payment.priceId,
+                currentPeriodEnd: null, // can be filled if you manage subscriptions & fetch from stripe.subscriptions
+                updatedAt: new Date(),
+              },
             },
             { merge: true }
           );
-        }
-        break;
-      }
 
-      case "customer.subscription.created":
-      case "customer.subscription.updated":
-      case "customer.subscription.deleted": {
-        const sub = event.data.object;
-
-        const userRef = await findUserRef({
-          userId: null,
-          customerId: sub.customer,
-          email: null,
-        });
-        if (!userRef) {
-          console.warn("⚠️ No matching user found for subscription event", {
-            customerId: sub.customer,
-          });
-          break;
+          // Keep a per-payment history under the user
+          await userRef.collection("payments").doc(session.id).set(payment);
+        } else {
+          console.warn(
+            "checkout.session.completed: Could not resolve a user doc (no UID/email match).",
+            { sessionId: session.id, email }
+          );
         }
 
-        await updateUserFromSubscription({ userRef, sub });
         break;
       }
 
-      case "invoice.payment_failed": {
-        const invoice = event.data.object;
-        const customerId = invoice.customer;
-
-        const userRef = await findUserRef({ userId: null, customerId, email: null });
-        if (!userRef) break;
-
-        await userRef.set(
-          {
-            lastPaymentFailedAt: FieldValue.serverTimestamp(),
-            updatedAt: FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-        break;
-      }
-
+      // Add more cases if you wish to keep status in sync:
+      // - "customer.subscription.updated"
+      // - "customer.subscription.deleted"
+      // (similar pattern: resolve user → update subscription fields)
+      
       default:
-        // keep unhandled events logged only
-        console.log("ℹ️ Unhandled event:", event.type);
+        // nothing special; you’re already logging all events above
+        break;
     }
 
     return res.status(200).json({ received: true });
   } catch (err) {
-    console.error("🔥 Handler error:", err);
+    console.error("Handler error:", err);
     return res.status(500).send("Internal Server Error");
   }
 }
